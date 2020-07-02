@@ -39,12 +39,53 @@ func (b *bufferedReader) Close() error {
 	return b.rOrig.Close()
 }
 
-func buildLogicalRequestNoAuth(perfStandby bool, w http.ResponseWriter, r *http.Request) (*logical.Request, io.ReadCloser, int, error) {
+func buildLogicalPathNoAuth(r *http.Request) (string, int, error) {
 	ns, err := namespace.FromContext(r.Context())
 	if err != nil {
-		return nil, nil, http.StatusBadRequest, nil
+		return "", http.StatusBadRequest, nil
 	}
-	path := ns.TrimmedPath(r.URL.Path[len("/v1/"):])
+
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/v1/") {
+		path = ns.TrimmedPath(path[len("/v1/"):])
+	}
+
+	switch r.Method {
+	case "GET":
+		var (
+			list bool
+			err  error
+		)
+
+		queryVals := r.URL.Query()
+
+		listStr := queryVals.Get("list")
+		if listStr != "" {
+			list, err = strconv.ParseBool(listStr)
+			if err != nil {
+				return "", http.StatusBadRequest, nil
+			}
+			if list {
+				if !strings.HasSuffix(path, "/") {
+					path += "/"
+				}
+			}
+		}
+
+	case "LIST":
+		if !strings.HasSuffix(path, "/") {
+			path += "/"
+		}
+	}
+
+	return path, 0, nil
+}
+
+func buildLogicalRequestNoAuth(perfStandby bool, w http.ResponseWriter, r *http.Request) (*logical.Request, io.ReadCloser, int, error) {
+	path, status, err := buildLogicalPathNoAuth(r)
+	if err != nil || status != 0 {
+		return nil, nil, status, err
+	}
 
 	var data map[string]interface{}
 	var origBody io.ReadCloser
@@ -58,10 +99,14 @@ func buildLogicalRequestNoAuth(perfStandby bool, w http.ResponseWriter, r *http.
 		op = logical.DeleteOperation
 		data = parseQuery(r.URL.Query())
 	case "GET":
+		var (
+			list bool
+			err  error
+		)
+
 		op = logical.ReadOperation
 		queryVals := r.URL.Query()
-		var list bool
-		var err error
+
 		listStr := queryVals.Get("list")
 		if listStr != "" {
 			list, err = strconv.ParseBool(listStr)
@@ -70,9 +115,6 @@ func buildLogicalRequestNoAuth(perfStandby bool, w http.ResponseWriter, r *http.
 			}
 			if list {
 				op = logical.ListOperation
-				if !strings.HasSuffix(path, "/") {
-					path += "/"
-				}
 			}
 		}
 
@@ -136,9 +178,6 @@ func buildLogicalRequestNoAuth(perfStandby bool, w http.ResponseWriter, r *http.
 
 	case "LIST":
 		op = logical.ListOperation
-		if !strings.HasSuffix(path, "/") {
-			path += "/"
-		}
 
 	case "OPTIONS":
 	case "HEAD":
@@ -254,6 +293,7 @@ func handleLogicalRecovery(raw *vault.RawBackend, token *atomic.String) http.Han
 // toggles. Refer to usage on functions for possible behaviors.
 func handleLogicalInternal(core *vault.Core, injectDataIntoTopLevel bool, noForward bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// TODO: Undo cast.
 		req, statusCode, err := setupLogicalRequest(core, w.(*LogicalResponseWriter).request, r)
 		if err != nil || statusCode != 0 {
 			respondError(w, statusCode, err)

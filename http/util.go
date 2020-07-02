@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 
 	"github.com/hashicorp/errwrap"
+	uuid "github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/vault"
@@ -36,29 +36,49 @@ func rateLimitQuotaWrapping(handler http.Handler, core *vault.Core) http.Handler
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
-		req := w.(*LogicalResponseWriter).request
+
+		path, status, err := buildLogicalPathNoAuth(r)
+		if err != nil || status != 0 {
+			respondError(w, status, err)
+			return
+		}
+
 		quotaResp, err := core.ApplyRateLimitQuota(&quotas.Request{
 			Type:          quotas.TypeRateLimit,
-			Path:          req.Path,
-			MountPath:     strings.TrimPrefix(req.MountPoint, ns.Path),
+			Path:          path,
 			NamespacePath: ns.Path,
 			ClientAddress: parseRemoteIPAddress(r),
 		})
 		if err != nil {
-			core.Logger().Error("failed to apply quota", "path", req.Path, "error", err)
+			core.Logger().Error("failed to apply quota", "path", path, "error", err)
 			respondError(w, http.StatusUnprocessableEntity, err)
 			return
 		}
 
 		if !quotaResp.Allowed {
-			quotaErr := errwrap.Wrapf(fmt.Sprintf("request path %q: {{err}}", req.Path), quotas.ErrRateLimitQuotaExceeded)
+			quotaErr := errwrap.Wrapf(fmt.Sprintf("request path %q: {{err}}", path), quotas.ErrRateLimitQuotaExceeded)
 			respondError(w, http.StatusTooManyRequests, quotaErr)
 
 			if core.Logger().IsTrace() {
-				core.Logger().Trace("request rejected due to lease count quota violation", "request_path", req.Path)
+				core.Logger().Trace("request rejected due to lease count quota violation", "request_path", path)
 			}
 
 			if core.RateLimitAuditLoggingEnabled() {
+				requestId, err := uuid.GenerateUUID()
+				if err != nil {
+					respondError(w, http.StatusBadRequest, errwrap.Wrapf("failed to generate identifier for the request: {{err}}", err))
+					return
+				}
+
+				req := &logical.Request{
+					ID: requestId,
+					// TODO: Do we need op? If so, we should consider refactoring buildLogicalPathNoAuth and/or buildLogicalRequestNoAuth.
+					// Operation:  op,
+					Path:       path,
+					Connection: getConnection(r),
+					Headers:    r.Header,
+				}
+
 				_ = core.AuditLogger().AuditRequest(r.Context(), &logical.LogInput{
 					Request:  req,
 					OuterErr: quotaErr,
