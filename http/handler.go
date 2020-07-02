@@ -221,21 +221,32 @@ func (w *copyResponseWriter) WriteHeader(code int) {
 
 func handleAuditNonLogical(core *vault.Core, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		input := &logical.LogInput{
-			Request: w.(*LogicalResponseWriter).request,
+		origBody := new(bytes.Buffer)
+		reader := ioutil.NopCloser(io.TeeReader(r.Body, origBody))
+		r.Body = reader
+
+		req, _, status, err := buildLogicalRequestNoAuth(core.PerfStandby(), w, r)
+		if err != nil || status != 0 {
+			respondError(w, status, err)
+			return
 		}
-		core.AuditLogger().AuditRequest(r.Context(), input)
+		if origBody != nil {
+			r.Body = ioutil.NopCloser(origBody)
+		}
+
+		input := &logical.LogInput{
+			Request: req,
+		}
+
+		_ = core.AuditLogger().AuditRequest(r.Context(), input)
 		cw := newCopyResponseWriter(w)
 		h.ServeHTTP(cw, r)
 		data := make(map[string]interface{})
-		err := jsonutil.DecodeJSON(cw.body.Bytes(), &data)
-		if err != nil {
-			// best effort, ignore
-		}
+
+		_ = jsonutil.DecodeJSON(cw.body.Bytes(), &data)
 		httpResp := &logical.HTTPResponse{Data: data, Headers: cw.Header()}
 		input.Response = logical.HTTPResponseToLogicalResponse(httpResp)
-		core.AuditLogger().AuditResponse(r.Context(), input)
-		return
+		_ = core.AuditLogger().AuditResponse(r.Context(), input)
 	})
 }
 
@@ -252,6 +263,7 @@ type LogicalResponseWriter struct {
 func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerProperties) http.Handler {
 	var maxRequestDuration time.Duration
 	var maxRequestSize int64
+
 	if props.ListenerConfig != nil {
 		maxRequestDuration = props.ListenerConfig.MaxRequestDuration
 		maxRequestSize = props.ListenerConfig.MaxRequestSize
@@ -262,6 +274,7 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 	if maxRequestSize == 0 {
 		maxRequestSize = DefaultMaxRequestSize
 	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set the Cache-Control header for all the responses returned
 		// by Vault
@@ -276,10 +289,12 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 		} else {
 			ctx, cancelFunc = context.WithTimeout(ctx, maxRequestDuration)
 		}
+
 		// Add a size limiter if desired
 		if maxRequestSize > 0 {
 			ctx = context.WithValue(ctx, "max_request_size", maxRequestSize)
 		}
+
 		ctx = context.WithValue(ctx, "original_request_path", r.URL.Path)
 		r = r.WithContext(ctx)
 		r = r.WithContext(namespace.ContextWithNamespace(r.Context(), namespace.RootNamespace))
@@ -301,29 +316,8 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 			return
 		}
 
-		origBody := new(bytes.Buffer)
-		reader := ioutil.NopCloser(io.TeeReader(r.Body, origBody))
-		r.Body = reader
-		req, _, status, err := buildLogicalRequestNoAuth(core.PerfStandby(), w, r)
-		if err != nil || status != 0 {
-			respondError(w, status, err)
-			return
-		}
-		// Reset the body since logical request creation already read the
-		// request body.
-		r.Body = ioutil.NopCloser(origBody)
-
-		// Set the mount path in the request
-		req.MountPoint = core.MatchingMount(r.Context(), req.Path)
-
-		// Pass the logical request down through the response writer
-		h.ServeHTTP(&LogicalResponseWriter{
-			ResponseWriter: w,
-			request:        req,
-		}, r)
-
+		h.ServeHTTP(w, r)
 		cancelFunc()
-		return
 	})
 }
 
